@@ -1,7 +1,7 @@
 """
 Autoresearch pretraining script. Single-GPU, single-file.
 Cherry-picked and simplified from nanochat.
-Usage: uv run train.py
+Usage: python train.py
 """
 
 import os
@@ -16,11 +16,69 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+class TorchSDPAFlashAttn:
+    """FlashAttention-compatible wrapper using PyTorch SDPA."""
+    def __init__(self):
+        self._mask_cache = {}
+
+    def _get_causal_window_mask(self, seq_len, window_size, device):
+        left, right = window_size
+        key = (seq_len, left, right, device)
+        mask = self._mask_cache.get(key)
+        if mask is None:
+            q_pos = torch.arange(seq_len, device=device).unsqueeze(1)
+            k_pos = torch.arange(seq_len, device=device).unsqueeze(0)
+            mask = k_pos <= q_pos
+            if left >= 0:
+                mask = mask & (k_pos >= (q_pos - left))
+            if right >= 0:
+                mask = mask & (k_pos <= (q_pos + right))
+            self._mask_cache[key] = mask
+        return mask
+
+    def flash_attn_func(self, q, k, v, causal=True, window_size=(-1, -1)):
+        # SDPA expects [B, H, T, D]; FA3 interface here uses [B, T, H, D].
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        if q.size(1) != k.size(1):
+            if q.size(1) % k.size(1) != 0:
+                raise ValueError(f"Incompatible GQA shapes: q_heads={q.size(1)}, kv_heads={k.size(1)}")
+            repeats = q.size(1) // k.size(1)
+            k = k.repeat_interleave(repeats, dim=1)
+            v = v.repeat_interleave(repeats, dim=1)
+
+        attn_mask = None
+        if causal and window_size is not None:
+            left, right = window_size
+            if left >= 0 or right >= 0:
+                attn_mask = self._get_causal_window_mask(q.size(-2), (left, right), q.device)
+                causal = False
+
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=causal)
+        return y.transpose(1, 2)
+
+
+def init_flash_attention_backend():
+    fallback = TorchSDPAFlashAttn()
+    if not torch.cuda.is_available():
+        print("Flash attention backend: torch SDPA (CUDA unavailable).")
+        return fallback
+
+    cap = torch.cuda.get_device_capability()
+    # varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
+    repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+    try:
+        from kernels import get_kernel
+        print(f"Flash attention backend: {repo}.")
+        return get_kernel(repo).flash_attn_interface
+    except Exception as e:
+        print(f"Flash attention backend fallback to torch SDPA (failed to load {repo}: {e}).")
+        return fallback
+
+
+fa3 = init_flash_attention_backend()
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -447,7 +505,17 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = 128  # per-device batch size target for >=80GB GPUs
+
+def select_device_batch_size(target_batch_size):
+    total_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    if total_gb >= 70:
+        return target_batch_size
+    if total_gb >= 48:
+        return min(target_batch_size, 64)
+    if total_gb >= 32:
+        return min(target_batch_size, 64)
+    return min(target_batch_size, 16)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -459,7 +527,10 @@ torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda")
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-H100_BF16_PEAK_FLOPS = 989.5e12
+H100_BF16_PEAK_FLOPS = 122.9e12
+DEVICE_BATCH_SIZE = select_device_batch_size(DEVICE_BATCH_SIZE)
+gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+print(f"GPU memory: {gpu_memory_gb:.1f}GB | device batch size: {DEVICE_BATCH_SIZE}")
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
